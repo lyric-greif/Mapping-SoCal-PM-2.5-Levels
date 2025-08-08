@@ -1,0 +1,456 @@
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+#install.packages("spgwr")
+#install.packages("sp")
+library(sp)
+#install.packages("sdpep")
+library(spdep)
+#install.packages("sf")
+library(sf)
+#library(tmap)
+library(spgwr)
+install.packages("modelsummary")
+library(modelsummary)
+
+block_shp = st_read("tl_2019_06_bg.shp") # Census Block Group Shapefile (from Census Bureau)
+
+#Simple feature collection with 23212 features and 12 fields
+#Geometry type: MULTIPOLYGON
+#Dimension:     XY
+#Bounding box:  xmin: -124.482 ymin: 32.52883 xmax: -114.1312 ymax: 42.0095
+#Geodetic CRS:  NAD83
+
+
+ej = read.csv("ej.csv") # CSV containing Census Block Group data (racial share and median income) for Southern California 
+
+# filter dataset by 2019 and get key variables
+ej_2019 = filter(ej, year == "2019")
+
+
+ej_2019_mean_pm = ej_2019 %>%
+  group_by(block_group) %>%
+  summarise(
+    mean_pm_2019 = mean(pm),
+    county_2019 = first(county),
+    black_2019 = first(share_black),
+    asian_2019 = first(share_asian),
+    hispanic_2019 = first(share_hispanic),
+    white_2019 = first(share_white),
+    medincome_2019 = first(medincome_block_group),
+    .groups = "drop"
+  )
+
+
+# Apply same filter to 2020
+ej_2020 = filter(ej, year == "2020")
+
+
+ej_2020_mean_pm = ej_2020 %>%
+  group_by(block_group) %>%
+  summarise(
+    mean_pm_2020 = mean(pm),
+    county_2020 = first(county),
+    black_2020 = first(share_black),
+    asian_2020 = first(share_asian),
+    hispanic_2020 = first(share_hispanic),
+    white_2020 = first(share_white),
+    medincome_2020 = first(medincome_block_group),
+    .groups = "drop"
+  )
+
+
+# Combine 2019 and 2020 in one df
+ej_df = ej_2020_mean_pm %>%
+  right_join(ej_2019_mean_pm, by = "block_group") # combined 2019 and 2020 to get delta pm
+
+ej_df = ej_df %>%
+  mutate(delta_pm = mean_pm_2020 - mean_pm_2019) # create column for delta pm
+
+
+
+# Exploratory bivariate regressions 
+reg1 = lm(mean_pm ~ black_share, data = ej_2019_mean_pm)
+summary(reg1)
+
+reg2 = lm(mean_pm ~ white_share, data = ej_2019_mean_pm)
+summary(reg2)
+
+reg3 = lm(mean_pm ~ asian_share, data = ej_2019_mean_pm)
+summary(reg3)
+
+reg4 = lm(mean_pm ~ hispanic_share, data = ej_2019_mean_pm)
+summary(reg4)
+
+reg5 = lm(mean_pm ~ block_group_medincome, data = ej_2019_mean_pm)
+summary(reg5)
+
+
+table = stargazer(reg1, reg2, reg3, reg4, reg5, type = "latex", title = "OLS Regression Results",
+                  dep.var.labels = (" 2019 Block Group Mean PM 2.5"),
+                  covariate.labels = c("Black Share", "White Share", "Asian Share","Hispanic Share", "Median Income"),
+                  ci = TRUE, ci.level = 0.90, no.space = T)
+
+ej_long <- ej_2019_mean_pm %>%
+  pivot_longer(
+    cols = c(black_share, white_share, asian_share, hispanic_share, block_group_medincome),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+ggplot(ej_long, aes(x = value, y = mean_pm, color = variable)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = T, color = "black", size = 1) +
+  facet_wrap(~ variable, scales = "free_x") +
+  labs(
+    title = "Relationship Between PM2.5, Median Income, & Racial Share of Census Block Groups (2019)",
+    x = "Independent Variable",
+    y = "Mean PM2.5",
+    color = "Variable"
+  ) +
+  theme_minimal()
+
+
+# Two Way Fixed Effects (DiD)
+
+# create dummy for post covid shutdown
+ej2 = ej %>%
+  mutate(post = ifelse(year == 2020 & month == 4, 1, 0))
+
+
+# Regress PM levels on post covid dummy, racial share, and median income; cluster by block group
+reg_fe = feols(pm ~ post * (share_black + share_asian + share_hispanic + medincome_block_group) | block_group, data = ej2)
+summary(reg_fe)
+
+stargazer(reg_fe, type = "text", title = "DiD Regression Results",
+          dep.var.labels = ("PM 2.5 Levels"),
+          covariate.labels = c("post", "post * black share", "post * asian share", "post * hispanic share", "post * median block group income"),
+          ci = T, ci.levels = 0.90, no.space = T)
+
+# Create model summary
+modelsummary(reg_fe,
+             title = "DiD Regression Results",
+             coef_map = c(
+               "post" = "Post",
+               "post:share_black" = "post × black Share",
+               "post:share_asian" = "post × asian share",
+               "post:share_hispanic" = "post × hispanic Share",
+               "post:med_income" = "post × block group median income"
+             ),
+             vcov = ~block_group,  # clustered SEs
+             conf_level = 0.90,
+             output = "fe.tex"
+)
+
+#------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Geographically weighted regression
+
+# Remove zeros in front of block id in shp & join with ej
+
+#block.sp <- as(block_shp, "Spatial")
+block_shp$block_group <- sub("^0", "", as.character(block_shp$GEOID))
+
+ej <- ej %>%
+  mutate(block_group = as.character(block_group))
+
+
+ej_spatial <- block_shp %>%
+  right_join(ej, by = "block_group")
+
+block_shp <- block_shp %>%
+  mutate(block_group = as.character(block_group))
+
+
+ej_spatial_clean <- ej_spatial %>%  # remove all rows with missing geometry, otherwise sp conversion won't work
+  filter(
+    !st_is_empty(geometry),
+    !is.na(st_geometry(.)) # luckily just a few rows
+  )
+
+ej_sp = as(ej_spatial_clean, "Spatial") # convert ej_spatial to sp object for GWR
+
+
+
+# Calculate kernel bandwidth using gwr.sel
+
+
+#gwr_b1<-gwr.sel(pm ~ share_black + share_asian + share_hispanic + medincome_block_group, ej_sp)
+
+#gwr_b1
+
+#ej_sp$black_share    <- as.numeric(ej_sp$share_black)
+#ej_sp$asian_share    <- as.numeric(ej_sp$share_asian)
+#ej_sp$hispanic_share <- as.numeric(ej_sp$share_hispanic)
+#ej_sp$medincome      <- as.numeric(ej_sp$medincome)
+#ej_sp$pm             <- as.numeric(ej_sp$pm)
+
+
+# filter year and aggregate by block group
+
+ej_spatial_2019 = filter(ej_spatial, year == "2019")
+
+
+ej_sp_2019 = ej_spatial_2019 %>%
+  group_by(block_group) %>%
+  summarise(
+    mean_pm = mean(pm),
+    county_name = first(county),
+    black_share = first(share_black),
+    asian_share = first(share_asian),
+    hispanic_share = first(share_hispanic),
+    white_share = first(share_white),
+    block_group_medincome = first(medincome_block_group),
+    geo_id = first(GEOID),
+    fips_code = first(fips),
+    geometry = first(geometry),
+    .groups = "drop"
+  )
+
+ej_clean = ej_sp_2019 %>% na.omit() # drop NAs so it can work as spdf
+
+sp_2019 = as(ej_clean, "Spatial")
+
+# Determine kernel bandwidth
+coords = st_coordinates(st_centroid(ej_df_spatial))
+gwr_b1=gwr.sel(delta_pm ~ black_2019 + asian_2019 + hispanic_2019 + medincome_2019, ej_df_spatial, coords = coords)
+gwr_b1
+
+gwr <- gwr(delta_pm~black_2019+ asian_2019 + hispanic_2019 + medincome_2019, data=ej_df_spatial, coords = coords, bandwidth=gwr_b1, gweight=gwr.Gauss, hatmatrix=TRUE)
+gwr
+
+
+# plot black share
+library(sp)
+spplot(
+  gwr$SDF,
+  "black_2019",       
+  main      = "Delta PM2.5 Coef: Black Share (2019)",
+  col.regions = rev(terrain.colors(20)),  
+  cuts      = 9,  # number of class breaks
+  sp.layout = list("sp.polygons", sp_2019, fill = NA, col = "grey50")
+)
+
+
+spplot(
+  gwr$SDF,
+  "hispanic_2019",          
+  main      = "Delta PM 2.5: Hispanic Share (2019)",
+  col.regions = rev(terrain.colors(20)),  
+  cuts      = 9,
+  sp.layout = list("sp.polygons", sp_2019, fill = NA, col = "grey50")
+)
+
+
+spplot(
+  gwr$SDF,
+  "asian_2019", 
+  main      = "Delta PM 2.5: Asian Share (2019)",
+  col.regions = rev(terrain.colors(20)), 
+  cuts      = 9,  
+  sp.layout = list("sp.polygons", sp_2019, fill = NA, col = "grey50")
+)
+
+
+
+spplot(
+  gwr$SDF,
+  "medincome_2019",  
+  main      = "Delta PM 2.5 Coef: Median Income (2019)",
+  col.regions = rev(terrain.colors(20)), 
+  cuts      = 9,  
+  sp.layout = list("sp.polygons", sp_2019, fill = NA, col = "grey50")
+)
+
+
+
+#--------------------------------------------------------------------------------------------------
+# Do the same for 2020!
+
+ej_spatial_2020 = filter(ej_spatial, year == "2020")
+
+
+ej_sp_2020 = ej_spatial_2020 %>%
+  group_by(block_group) %>%
+  summarise(
+    mean_pm = mean(pm),
+    county_name = first(county),
+    black_share = first(share_black),
+    asian_share = first(share_asian),
+    hispanic_share = first(share_hispanic),
+    white_share = first(share_white),
+    block_group_medincome = first(medincome_block_group),
+    geo_id = first(GEOID),
+    fips_code = first(fips),
+    geometry = first(geometry),
+    .groups = "drop"
+  )
+
+ej_clean_2020 = ej_sp_2020 %>% na.omit() # drop NAs so it can work as spdf
+
+sp_2020 = as(ej_clean_2020, "Spatial")
+
+# Determine kernel bandwidth
+gwr_b2<-gwr.sel(mean_pm ~ black_share + asian_share + hispanic_share + block_group_medincome, sp_2020)
+gwr_b2
+
+gwr2 <- gwr(mean_pm~black_share + asian_share + hispanic_share + block_group_medincome, data=sp_2020, bandwidth=gwr_b2, gweight=gwr.Gauss, hatmatrix=TRUE)
+
+gwr2
+
+
+# plot black share
+library(sp)
+spplot(
+  gwr2$SDF,
+  "black_share", 
+  main      = "GWR Coef: Black Share (2020)",
+  col.regions = rev(terrain.colors(20)), 
+  cuts      = 9,  
+  sp.layout = list("sp.polygons", sp_2019, fill = NA, col = "grey50")
+)
+
+
+spplot(
+  gwr2$SDF,
+  "hispanic_share",  
+  main      = "GWR Coef: Hispanic Share (2020)",
+  col.regions = rev(terrain.colors(20)),
+  cuts      = 9, 
+  sp.layout = list("sp.polygons", sp_2019, fill = NA, col = "grey50")
+)
+
+
+spplot(
+  gwr2$SDF,
+  "asian_share",   
+  main      = "GWR Coef: Asian Share (2020)",
+  col.regions = rev(terrain.colors(20)), 
+  cuts      = 9,  
+  sp.layout = list("sp.polygons", sp_2019, fill = NA, col = "grey50")
+)
+
+
+
+
+# Compute Morans I 
+
+
+# 2019 OLS 
+
+model1 = lm(delta_pm ~ black_2019 + asian_2019 + hispanic_2019 + medincome_2019, data = ej_df_spatial)
+
+residuals_model1 <- residuals(model1)
+
+# align spatial data w model data
+
+ej_df <- ej_df %>%
+  mutate(block_group = as.character(block_group))
+
+ej_df_spatial = ej_df %>%
+  left_join(block_shp, by = "block_group")
+
+ej_df_spatial = na.omit(ej_df_spatial)
+
+ej_df_spatial <- st_as_sf(ej_df_spatial)
+class(ej_df_spatial)
+st_geometry_type(ej_df_spatial)
+
+# spatial weight matrix
+
+nb = poly2nb(ej_df_spatial)
+listw = nb2listw(nb, style = "W", zero.policy = TRUE)
+moran_result <- lm.morantest(model1, listw, zero.policy = TRUE)
+print(moran_result)
+
+# Combine 2019 and 2020 datasets to get mean PM 
+
+
+test1 = ej_spatial_2019 %>%
+  left_join(ej_spatial_2020, by = "block_group")
+
+
+
+
+# K Nearest Neighbor
+
+#find centroids of block groups
+coords = st_coordinates(st_centroid(ej_df_spatial))
+
+#  knn 
+knn3 = knn2nb(knearneigh(coords, k = 3))
+knn = knn2nb(knearneigh(coords, k = 4)) # for sensitivity testing
+knn5 = knn2nb(knearneigh(coords, k = 5))
+
+# weights
+listw_knn <- nb2listw(knn, style = "W")
+listw_knn3 <- nb2listw(knn3, style = "W")
+listw_knn5 <- nb2listw(knn5, style = "W")
+
+# morans I test models
+model <- lm(mean_pm_2019 ~ black_2019 + asian_2019 + hispanic_2019 + medincome_2019,
+             data = ej_df_spatial)
+
+
+model1 <- lm(delta_pm ~ black_2019 + asian_2019 + hispanic_2019 + medincome_2019,
+             data = ej_df_spatial)
+
+
+summary(model)
+summary(model1)
+# make s stargazer table for this
+
+library(stargazer)
+stargazer(model1, type = "text", title = "DiD Regression Results",
+          dep.var.labels = ("Delta PM 2.5 Levels"),
+          covariate.labels = c("Black share 2019", "Asian share 2019", "Hispanic share 2019", "Median block group income 2019"),
+          ci = T, ci.levels = 0.90, no.space = T)
+
+
+
+# run morans I 
+
+lm.morantest(model1, listw_knn)
+
+lm.morantest(model1, listw_knn3)
+
+lm.morantest(model1, listw_knn5)
+
+
+# SEM (spatial error model)
+install.packages("spatialreg")
+library(spatialreg)
+
+sem_model = errorsarlm(delta_pm ~ black_2019 + asian_2019 + hispanic_2019 + medincome_2019, # main model, k = 4
+                        data = ej_df_spatial,
+                        listw = listw_knn)
+summary(sem_model)
+
+
+
+sem_model3 = errorsarlm(delta_pm ~ black_2019 + asian_2019 + hispanic_2019 + medincome_2019, # k = 3
+                       data = ej_df_spatial,
+                       listw = listw_knn3)
+summary(sem_model3)
+
+
+
+
+sem_model5 = errorsarlm(delta_pm ~ black_2019 + asian_2019 + hispanic_2019 + medincome_2019, # k = 5
+                        data = ej_df_spatial,
+                        listw = listw_knn5)
+summary(sem_model5)
+
+
+
+
+# map coefs
+gwr_df = as.data.frame(gwr$SDF) 
+
+block_shp_gwr = block_shp %>%
+  left_join(gwr_df, by = "block_group")
+
+
+
+ej_df_export <- st_drop_geometry(ej_df_spatial)
+write.csv(ej_df_export, "ej_df_export.csv", row.names = FALSE)
